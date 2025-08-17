@@ -1,4 +1,4 @@
-# app.py (야후 파이낸스 전용 최종 버전)
+# app.py (KeyError 최종 해결 버전)
 
 import streamlit as st
 import pandas as pd
@@ -26,20 +26,22 @@ class LSTMAttentionClassifier(nn.Module):
         context_vector = torch.sum(attention_weights * lstm_out, dim=1)
         return torch.sigmoid(self.classifier_fc(context_vector))
 
-# --- 2. 데이터 수집 함수 (야후 파이낸스 전용으로 수정) ---
+# --- 2. 데이터 수집 함수 (야후 파이낸스 전용 및 소문자 처리) ---
 @st.cache_data(ttl=300)
 def fetch_prediction_data(symbol):
     days = 150
     start_date = (datetime.now(UTC) - timedelta(days=days)).strftime('%Y-%m-%d')
     
-    # [수정] yfinance만 사용하도록 변경
     try:
         price_df = yf.download(f"{symbol}-USD", start=start_date, progress=False, auto_adjust=True)
-        if isinstance(price_df.columns, pd.MultiIndex):
-            price_df.columns = price_df.columns.droplevel(0)
+        
         if price_df.empty:
             st.error(f"{symbol}에 대한 데이터를 Yahoo Finance에서 가져올 수 없습니다.")
             return None
+            
+        # [수정] 모든 컬럼 이름을 소문자로 강제 변환
+        price_df.columns = [col.lower() for col in price_df.columns]
+        
     except Exception as ex:
         st.error(f"Yahoo Finance 데이터 수집 중 오류 발생: {ex}")
         return None
@@ -47,7 +49,7 @@ def fetch_prediction_data(symbol):
     master_df = price_df.copy()
     master_df.index = master_df.index.tz_localize(None)
 
-    # 거시/특화 데이터 수집 로직은 동일
+    # 거시 경제 데이터
     try:
         fred_api_key = st.secrets['FRED_API_KEY']
         url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTWEXBGS&api_key={fred_api_key}&file_type=json&observation_start={start_date}"
@@ -71,6 +73,7 @@ def fetch_prediction_data(symbol):
     except Exception as e:
         st.warning(f"FNG 데이터 수집 실패: {e}")
 
+    # 자산별 특화 데이터
     try:
         if symbol == 'BTC':
             res_cm = requests.get(f"https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=CapMrktCurUSD,TxTfrValAdjUSD&start_time={start_date}&frequency=1d")
@@ -95,17 +98,20 @@ def fetch_prediction_data(symbol):
     except Exception as e:
         st.warning(f"{symbol} 특화 데이터 수집 실패: {e}")
 
+    # 최종 데이터 가공
     master_df.ffill(inplace=True)
     master_df.bfill(inplace=True)
-    master_df['rsi'] = ta.momentum.RSIIndicator(master_df['Close'], 14).rsi()
-    master_df['macd'] = ta.trend.MACD(master_df['Close']).macd_diff()
-    bb = ta.volatility.BollingerBands(master_df['Close'], window=20)
+
+    # [수정] 컬럼명을 모두 소문자로 변경
+    master_df['rsi'] = ta.momentum.RSIIndicator(master_df['close'], 14).rsi()
+    master_df['macd'] = ta.trend.MACD(master_df['close']).macd_diff()
+    bb = ta.volatility.BollingerBands(master_df['close'], window=20)
     master_df['bb_width'] = bb.bollinger_wband()
-    master_df['obv'] = ta.volume.OnBalanceVolumeIndicator(master_df['Close'], master_df['Volume']).on_balance_volume()
+    master_df['obv'] = ta.volume.OnBalanceVolumeIndicator(master_df['close'], master_df['volume']).on_balance_volume()
     
     return master_df
 
-# --- 3. Streamlit UI (이전과 동일) ---
+# --- 3. Streamlit UI ---
 st.set_page_config(page_title="Gemini-Crypto Predictor", layout="wide")
 st.title("🚀 Gemini-Crypto Predictor")
 st.info("안정성이 검증된 LSTMAttention AI 모델 5개의 예측을 종합한 앙상블 분석 결과입니다.")
@@ -120,12 +126,13 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
             st.error("데이터가 부족하여 예측을 수행할 수 없습니다.")
             st.stop()
         
+        # [수정] 피처 리스트의 컬럼명을 모두 소문자로 변경
         if selected_asset == 'BTC':
-            features = ['Close', 'Volume', 'dxy', 'fng_value', 'nvt_ratio', 'rsi', 'macd', 'bb_width', 'obv']
+            features = ['close', 'volume', 'dxy', 'fng_value', 'nvt_ratio', 'rsi', 'macd', 'bb_width', 'obv']
         elif selected_asset == 'ETH':
-            features = ['Close', 'Volume', 'dxy', 'fng_value', 'eth_tvl', 'rsi', 'macd', 'bb_width', 'obv']
+            features = ['close', 'volume', 'dxy', 'fng_value', 'eth_tvl', 'rsi', 'macd', 'bb_width', 'obv']
         else: # SOL
-            features = ['Close', 'Volume', 'dxy', 'fng_value', 'sol_tvl', 'rsi', 'macd', 'bb_width', 'obv']
+            features = ['close', 'volume', 'dxy', 'fng_value', 'sol_tvl', 'rsi', 'macd', 'bb_width', 'obv']
         
         N_MODELS = 5
         predictions = []
@@ -163,7 +170,8 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
             st.success("🎉 예측 완료!")
             col1, col2 = st.columns(2)
             col1.metric("AI 앙상블 예측 상승 확률", f"{final_prob:.2%}")
-            col2.metric("분석 기준 가격", f"${df['Close'].iloc[-1]:,.2f}")
+            # [수정] 가격 표시 컬럼명을 소문자 'close'로 변경
+            col2.metric("분석 기준 가격", f"${df['close'].iloc[-1]:,.2f}")
             
             with st.expander("개별 모델 예측 보기"):
                 chart_data = pd.DataFrame({
@@ -174,4 +182,3 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
 
         except Exception as e:
             st.error(f"예측 중 오류 발생: {e}")
-
