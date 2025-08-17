@@ -1,4 +1,4 @@
-# app.py (LSTMAttention 앙상블 모델용 최종 앱)
+# app.py (야후 파이낸스 전용 최종 버전)
 
 import streamlit as st
 import pandas as pd
@@ -9,16 +9,15 @@ import torch.nn.functional as F
 import ta
 import yfinance as yf
 import requests
-import ccxt
 from datetime import datetime, timedelta, UTC
 import os
 
-# --- 1. AI 모델 정의 (학습 스크립트와 동일한 LSTMAttention 모델) ---
+# --- 1. AI 모델 정의 (LSTMAttention 최종 강화 버전) ---
 class LSTMAttentionClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim=256, num_layers=3, dropout=0.4):
         super(LSTMAttentionClassifier, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, bidirectional=True)
-        self.attention_fc = nn.Linear(hidden_dim * 2, 1) # 양방향이라 *2
+        self.attention_fc = nn.Linear(hidden_dim * 2, 1)
         self.classifier_fc = nn.Linear(hidden_dim * 2, 1)
 
     def forward(self, x):
@@ -27,46 +26,28 @@ class LSTMAttentionClassifier(nn.Module):
         context_vector = torch.sum(attention_weights * lstm_out, dim=1)
         return torch.sigmoid(self.classifier_fc(context_vector))
 
-# --- 2. 데이터 수집 함수 ---
-@st.cache_data(ttl=300) # 5분 동안 결과 캐싱
+# --- 2. 데이터 수집 함수 (야후 파이낸스 전용으로 수정) ---
+@st.cache_data(ttl=300)
 def fetch_prediction_data(symbol):
-    days = 150 # 예측에는 최근 150일 데이터만 사용
+    days = 150
     start_date = (datetime.now(UTC) - timedelta(days=days)).strftime('%Y-%m-%d')
     
-    # 가격 데이터 (ccxt 우선, yf fallback)
-    price_df = None
+    # [수정] yfinance만 사용하도록 변경
     try:
-        # Streamlit Cloud의 Secrets에서 API 키를 가져와 ccxt에 인증
-        exchange = ccxt.binance({
-            'apiKey': st.secrets.get('BINANCE_API_KEY'),
-            'secret': st.secrets.get('BINANCE_SECRET_KEY'),
-        })
-        ohlcv = exchange.fetch_ohlcv(f'{symbol}/USDT', '1d', since=exchange.parse8601(f"{start_date}T00:00:00Z"), limit=days)
-        price_df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        price_df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
-        price_df['timestamp'] = pd.to_datetime(price_df['timestamp'], unit='ms')
-        price_df.set_index('timestamp', inplace=True)
-    except Exception as e:
-        st.warning(f"ccxt 데이터 수집 실패 ({e}). Yahoo Finance로 대체합니다.")
-        try:
-            price_df = yf.download(f"{symbol}-USD", start=start_date, progress=False, auto_adjust=True)
-            if isinstance(price_df.columns, pd.MultiIndex):
-                price_df.columns = price_df.columns.droplevel(0)
-            if price_df.empty:
-                st.error(f"{symbol}에 대한 데이터를 Yahoo Finance에서도 가져올 수 없습니다.")
-                return None
-        except Exception as ex:
-            st.error(f"Yahoo Finance 데이터 수집 중 오류 발생: {ex}")
+        price_df = yf.download(f"{symbol}-USD", start=start_date, progress=False, auto_adjust=True)
+        if isinstance(price_df.columns, pd.MultiIndex):
+            price_df.columns = price_df.columns.droplevel(0)
+        if price_df.empty:
+            st.error(f"{symbol}에 대한 데이터를 Yahoo Finance에서 가져올 수 없습니다.")
             return None
-    
-    if price_df is None or price_df.empty:
-        st.error("모든 데이터 소스에서 가격 정보를 가져오지 못했습니다.")
+    except Exception as ex:
+        st.error(f"Yahoo Finance 데이터 수집 중 오류 발생: {ex}")
         return None
-
+    
     master_df = price_df.copy()
     master_df.index = master_df.index.tz_localize(None)
 
-    # 거시 경제 데이터 (FRED, FNG)
+    # 거시/특화 데이터 수집 로직은 동일
     try:
         fred_api_key = st.secrets['FRED_API_KEY']
         url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTWEXBGS&api_key={fred_api_key}&file_type=json&observation_start={start_date}"
@@ -90,7 +71,6 @@ def fetch_prediction_data(symbol):
     except Exception as e:
         st.warning(f"FNG 데이터 수집 실패: {e}")
 
-    # 자산별 특화 데이터 (온체인, TVL)
     try:
         if symbol == 'BTC':
             res_cm = requests.get(f"https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=CapMrktCurUSD,TxTfrValAdjUSD&start_time={start_date}&frequency=1d")
@@ -115,7 +95,6 @@ def fetch_prediction_data(symbol):
     except Exception as e:
         st.warning(f"{symbol} 특화 데이터 수집 실패: {e}")
 
-    # 최종 데이터 가공
     master_df.ffill(inplace=True)
     master_df.bfill(inplace=True)
     master_df['rsi'] = ta.momentum.RSIIndicator(master_df['Close'], 14).rsi()
@@ -126,7 +105,7 @@ def fetch_prediction_data(symbol):
     
     return master_df
 
-# --- 3. Streamlit UI ---
+# --- 3. Streamlit UI (이전과 동일) ---
 st.set_page_config(page_title="Gemini-Crypto Predictor", layout="wide")
 st.title("🚀 Gemini-Crypto Predictor")
 st.info("안정성이 검증된 LSTMAttention AI 모델 5개의 예측을 종합한 앙상블 분석 결과입니다.")
@@ -157,20 +136,17 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
                 if f not in latest_data.columns:
                     latest_data[f] = 0.0
             
-            # 표준화(StandardScaler)로 변경
             scaled_features = (latest_data[features] - latest_data[features].mean()) / latest_data[features].std()
             scaled_features.fillna(0, inplace=True)
             tensor = torch.tensor(np.array([scaled_features.values]), dtype=torch.float32)
 
             for i in range(N_MODELS):
-                # 최종 강화 LSTM 모델 파일명을 불러오도록 수정
                 model_path = f'gemini_{selected_asset.lower()}_lstm_model_{i}.pth'
                 if not os.path.exists(model_path):
                     st.warning(f"모델 파일({model_path})을 찾을 수 없습니다. 다음 모델로 넘어갑니다.")
                     continue
 
                 model = LSTMAttentionClassifier(input_dim=len(features))
-                # 클라우드 환경(CPU)에서 실행되도록 map_location 설정
                 model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
                 model.eval()
 
@@ -182,7 +158,6 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
                 st.error("예측에 사용할 모델을 하나도 찾을 수 없습니다. 모델 파일들을 GitHub에 함께 업로드했는지 확인하세요.")
                 st.stop()
 
-            # 소프트 보팅: 예측 확률의 평균 계산
             final_prob = np.mean(predictions)
 
             st.success("🎉 예측 완료!")
@@ -199,3 +174,4 @@ if st.button(f"최신 {selected_asset} 상승 확률 예측하기"):
 
         except Exception as e:
             st.error(f"예측 중 오류 발생: {e}")
+
