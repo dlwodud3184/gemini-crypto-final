@@ -1,0 +1,8 @@
+streamlit
+torch
+pandas
+yfinance
+ta
+ccxt
+requests
+numpy
